@@ -1,0 +1,177 @@
+service: kinesis-stream-exemple
+
+variablesResolutionMode: 20210326
+
+custom:
+  stage: ${opt:stage, self:provider.stage} 
+  region: ${opt:region, self:provider.region}
+  deployment_bucket: ${self:service}-deployment-${self:custom.stage}
+  accountid: ${aws:accountId}
+  email: YOUR_EMAIL
+  ip: YOUR_IP
+  pythonRequirements:
+    dockerizePip: non-linux
+  individually-for-dev: 
+    dev: False
+
+provider:
+  name: aws
+  runtime: python3.8
+  stage: dev
+  region: us-east-1
+  stackName: ${self:service}-${self:custom.stage}
+  lambdaHashingVersion: 20201221
+  stackTags:
+    Owner: JontasDelatorre
+  deploymentBucket:
+    name: ${self:custom.deployment_bucket}
+    serverSideEncryption: AES256
+
+package:
+  individually: true
+  patterns:
+    - '!venv/**'
+    - '!test/**'
+    - '!buildspec.yml'
+    - '!functions/**'
+    - '!README.md'
+    - '!node_modules/**'
+    - '!src/**'
+    - '!package-lock.json'
+    - '!package.json'
+    - '!resources.yml'
+    - '!step_functions.yml'
+
+functions:
+  ConsumerLambda:
+    handler: src/kinesis_consumer.handler
+    name: ${self:service}-consumer-${self:custom.stage}
+    description: Lambda for kinesis stream consumer
+    memorySize: 1024
+    timeout: 300
+    events:
+      - stream:
+          type: kinesis
+          arn: !GetAtt KinesisClickStream.Arn
+    environment:
+      BUCKET: !Ref ClickstreamOutput
+      TOPIC: !Ref ClickstreamTopicTest
+    package:
+      patterns:
+        - src/kinesis_consumer.py
+    iamRoleStatementsName: ${self:service}-consumer-${self:custom.stage}
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action:
+          - s3:GetObject
+          - s3:GetObjectVersion
+          - s3:ListBucket
+          - s3:PutObject
+          - s3:GetObject
+          - s3:GetObjectVersion
+          - s3:ListBucket
+        Resource:
+          - !GetAtt ClickstreamOutput.Arn
+          - !Join [ "", [ !GetAtt ClickstreamOutput.Arn, "/*"] ]
+      - Effect: "Allow"
+        Action:
+          - sns:Publish
+        Resource:
+          - !Ref ClickstreamTopicTest
+      - Effect: "Allow"
+        Action:
+          - kinesis:DescribeStream
+          - kinesis:DescribeStreamSummary
+          - kinesis:GetRecords
+          - kinesis:ListShards
+          - kinesis:GetShardIterator
+          - kinesis:ListStreams
+          - kinesis:SubscribeToShard
+        Resource:
+          - !GetAtt KinesisClickStream.Arn
+
+resources:
+  Resources:
+    KinesisClickStream:
+      Type: AWS::Kinesis::Stream
+      Properties: 
+        Name: ${self:service}-clickstream-${self:custom.stage}
+        ShardCount: 1
+        StreamModeDetails: 
+          StreamMode: PROVISIONED
+
+    ClickstreamOutput:
+      Type: AWS::S3::Bucket
+      Properties:
+        VersioningConfiguration:
+          Status: Enabled
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        BucketName: !Sub ${self:service}-clickstream-output-${AWS::AccountId}-${self:custom.stage}
+
+    ClickstreamOutputAppIdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties: 
+        AllowUnauthenticatedIdentities: true
+        IdentityPoolName: ${self:service}-clickstream-${self:custom.stage}
+
+    IdentityPoolRoleAttachment: 
+      Type: AWS::Cognito::IdentityPoolRoleAttachment 
+      Properties: 
+        IdentityPoolId: !Ref ClickstreamOutputAppIdentityPool
+        Roles: 
+          "unauthenticated": !GetAtt UnauthenticatedIdentitiesRole.Arn 
+
+    UnauthenticatedIdentitiesRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref ClickstreamOutputAppIdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: unauthenticated
+        Policies:
+          - PolicyName: ${self:service}-clickstream-unauthenticated-${self:custom.stage}
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: 
+                    - kinesis:DescribeStream
+                    - kinesis:DescribeStreamSummary
+                    - kinesis:ListShards
+                    - kinesis:ListStreams
+                    - kinesis:PutRecord
+                    - kinesis:PutRecords
+                  Resource: 
+                    - !GetAtt KinesisClickStream.Arn
+                - Effect: "Deny"
+                  Action: 
+                    - "*"    
+                  Resource: 
+                    - "*"
+                  Condition:
+                    NotIpAddress:
+                      aws:SourceIp:
+                        - ${self:custom.ip}
+
+    ClickstreamTopicTest:
+        Type: AWS::SNS::Topic
+        Properties:
+          Subscription:
+            - Endpoint: ${self:custom.email}
+              Protocol: "email"
+          TopicName: ${self:service}-clickstream-unauthenticated-email-${self:custom.stage}
+
+plugins:
+  - serverless-iam-roles-per-function # Plugin de criação de role e policy para cada lambda
+  - serverless-python-requirements #Plugin para automatizar a inclusao dos pacotes presentes no requirements
+  - serverless-deployment-bucket #Plugin para gerenciar criacao de bucket de deployment....
